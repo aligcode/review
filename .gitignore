@@ -4,3 +4,4 @@ dataset/
 *jpg
 output/
 diffusion/
+*.pyc
