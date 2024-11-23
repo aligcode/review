@@ -10,7 +10,8 @@ class ConditionalLayer(nn.Module):
         self.feature_dim = feature_dim
         self.linear = nn.Linear(in_features=input_dim, out_features=feature_dim)
         self.embedding = nn.Embedding(num_embeddings=n_steps, embedding_dim=feature_dim)
-    
+        self.embedding.weight.data.uniform_()
+        
     def forward(self, x, t):
         # x: [B, input_dim]
         linear_out = self.linear(x)
@@ -80,7 +81,6 @@ class LabelDenoisingDiffusionModel(nn.Module):
         # x0: [B, 10]
         # t: [B, 1]
         # noise: [B, 10]
-        assert self.device_id is not None
         sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t) # [batch_size]
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t) # [batch_size]
         
