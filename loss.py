@@ -8,6 +8,7 @@ class NTXentLoss(nn.Module):
 
     def __init__(self):
         super(NTXentLoss, self).__init__()
+        self.temperature = 0.1
         
     def forward(self, p1, p2):  
         
@@ -24,6 +25,7 @@ class NTXentLoss(nn.Module):
          
         # cosine similarity [2*batch, 2*batch]
         p_cosine = torch.divide(p_cat_dot, p_cat_norm_prod + 1e-8)
+        p_cosine = p_cosine / self.temperature
         assert p_cosine.shape == (2*batch_size, 2*batch_size)
 
         # p_cosine: [2*batch_size, 2*batch_size]: (i, j) [:batch_size, batch_size:] (j, i) [batch_size:, :batch_size]

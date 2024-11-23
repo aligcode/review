@@ -8,9 +8,9 @@ class ConvTwoLayerMLP(nn.Module):
         super(ConvTwoLayerMLP, self).__init__()
         self.pretrain = pretrain
         self.conv1 = nn.Conv2d(in_channels=input_dim, out_channels=32, kernel_size=3, stride=1)
-        self.bn1 = nn.BatchNorm2d(num_features=32)
+        self.gn1 = nn.GroupNorm(num_groups=8, num_channels=32)
         self.conv2 = nn.Conv2d(in_channels=32, out_channels=128, kernel_size=5, stride=2)
-        self.bn2 = nn.BatchNorm2d(num_features=128)
+        self.gn2 = nn.GroupNorm(num_groups=16, num_channels=128)
         self.relu = nn.ReLU(inplace=True)
         self.fc1 = nn.Linear(128, 32, bias=True)
         self.fc2 = nn.Linear(32, num_classes)
@@ -20,8 +20,8 @@ class ConvTwoLayerMLP(nn.Module):
 
     def encode(self, x):
         batch_size = x.shape[0]
-        l1_out = self.relu(self.bn1(self.conv1(x)))
-        l2_out = self.relu(self.bn2(self.conv2(l1_out)))
+        l1_out = self.relu(self.gn1(self.conv1(x)))
+        l2_out = self.relu(self.gn2(self.conv2(l1_out)))
         img_feat = F.adaptive_avg_pool2d(l2_out, output_size=1)
         img_feat_flattened = img_feat.view(batch_size, -1)
         return img_feat_flattened
