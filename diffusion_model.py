@@ -132,6 +132,8 @@ if __name__ == '__main__':
         # simulate forward process and learning
         pred_noise, gt_noise = diffusion_model.forward_t(x_embed=random_feat, x0=random_label, t=torch.tensor(t))
         print(f"Step {t} gt_noise {gt_noise.shape} | pred_noise {pred_noise.shape}")
+        mse_loss_t = F.mse_loss(pred_noise, gt_noise, reduction='mean')
+        print(f"MSE calculated for step {t}: {mse_loss_t}")
         
     # backward process (denoising)
     noisy_label_batch = torch.randint(low=0, high=10, size=(batch_size, num_classes)).float()
