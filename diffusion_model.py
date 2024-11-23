@@ -52,6 +52,8 @@ class DiffusionModel(nn.Module):
         self.feature_dim = x_emb_dim
         self.betas = self.get_noise_schedule(schedule='linear', num_steps=self.n_steps, start=1e-5, end=1e-2)
         self.alphas = 1.0 - self.betas
+        self.sqrt_alphas = torch.sqrt(self.alphas)
+        self.sqrt_one_minus_alphas = torch.sqrt(1.0 - self.alphas)
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0) # signal contribution
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod) # scaled signal contribution coeff
         self.one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod # noise contribution coeff
@@ -69,7 +71,7 @@ class DiffusionModel(nn.Module):
     def q_sample(self, x0, t, noise):
         # x0: [B, 10]
         # t: [B, 1]
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t)
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t) # 1
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t)
         
         sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t.view(-1, 1)
@@ -83,12 +85,30 @@ class DiffusionModel(nn.Module):
         noise_pred = self.model(x_embed=x_embed, x=xt, t=t)
         return noise_pred, noise
     
-    def reverse(self):
-        # not implemented yet
-        pass
-    
+    def reverse(self, x_embed, xt):
+        # x_embed: [batch, feature_dim]
+        # xt: [batch, num_classes]
         
+        for t in reversed(range(self.n_steps)):
+            t_tens = torch.tensor(t)
+            noise_pred = self.model(x_embed=x_embed, x=xt, t=t_tens) # [batch, self.x_dim]
+            
+            sqrt_one_minus_alphas_t = self.sqrt_one_minus_alphas.gather(0, t_tens) # [1]
+            sqrt_alphas_t = self.sqrt_alphas.gather(0, t_tens) # [1]
+            
+            x_t_minus_1 = torch.divide(xt - sqrt_one_minus_alphas_t * noise_pred, sqrt_alphas_t)
+            
+            if t > 0:
+                beta_t = self.betas.gather(0, t_tens)
+                sigma_t = torch.sqrt(beta_t)
+                stochastic_sampling_noise = sigma_t * torch.randn_like(xt) # sigma = 1
+                x_t_minus_1 = x_t_minus_1 + stochastic_sampling_noise
+                
+            xt = x_t_minus_1
+
+        x0 = xt
         
+        return x0
 
 if __name__ == '__main__':
     
@@ -109,6 +129,12 @@ if __name__ == '__main__':
     ts = [1, 100, 600]
     
     for t in ts:
-        
+        # simulate forward process and learning
         pred_noise, gt_noise = diffusion_model.forward_t(x_embed=random_feat, x0=random_label, t=torch.tensor(t))
-        print(f"Step {t} gt_noise {gt_noise} | pred_noise {pred_noise}")
+        print(f"Step {t} gt_noise {gt_noise.shape} | pred_noise {pred_noise.shape}")
+        
+    # backward process (denoising)
+    noisy_label_batch = torch.randint(low=0, high=10, size=(batch_size, num_classes)).float()
+    random_feat = torch.randn(batch_size, feature_dim)
+    clean_label_batch = diffusion_model.reverse(x_embed=random_feat, xt=noisy_label_batch)
+    print(f"Clean labels obtained from denoising process: {clean_label_batch.shape}")
