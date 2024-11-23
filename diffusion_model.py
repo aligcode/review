@@ -6,6 +6,8 @@ class ConditionalLayer(nn.Module):
     def __init__(self, input_dim, feature_dim, n_steps):
         super(ConditionalLayer, self).__init__()
         self.output_dim = feature_dim
+        self.input_dim = input_dim
+        self.feature_dim = feature_dim
         self.linear = nn.Linear(in_features=input_dim, out_features=feature_dim)
         self.embedding = nn.Embedding(num_embeddings=n_steps, embedding_dim=feature_dim)
     
@@ -35,7 +37,9 @@ class ConditionalModel(nn.Module):
         self.l4 = nn.Linear(in_features=self.feature_dim, out_features=self.output_dim)
         
     def forward(self, x_embed, x, t):
-        
+        # x_embed: [batch, 128
+        # x: [batch, 10]
+        # t: [batch]
         x_e = self.x_embed_bn(x_embed)
         out_cl1 = F.softplus(self.bn1(self.cl1(x=x, t=t)))
         modulated_x = x_e * out_cl1
@@ -84,6 +88,7 @@ class LabelDenoisingDiffusionModel(nn.Module):
         return F.mse_loss(pred, gt, reduction='mean')
     
     def forward_t(self, x_embed, x0, t):
+        x0 = F.one_hot(x0.long(), num_classes=self.x_dim).float()
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0=x0, t=t, noise=noise)
         noise_pred = self.model(x_embed=x_embed, x=xt, t=t)
@@ -111,7 +116,7 @@ class LabelDenoisingDiffusionModel(nn.Module):
             xt = x_t_minus_1
 
         x0 = xt
-        
+        x0 = torch.argmax(x0, dim=-1) # one hot to integer
         return x0
 
 if __name__ == '__main__':
