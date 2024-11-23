@@ -47,23 +47,29 @@ class Trainer:
             
         self.num_epochs = num_epochs
         self.checkpoint_dir = checkpoint_dir
-        
-    def save_checkpoint(self, epoch, metrics):
+    
+    def save_checkpoint(self, epoch, metrics, model_name):
+        save_model = self.model if model_name == 'main_model' else self.label_denoising_diffusion_model
         checkpoint_info = {
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': save_model.state_dict(),
             'epoch': epoch
         }
-        for k, v in metrics.items():
-            checkpoint_info[k] = v
+        if metrics != None:
+            for k, v in metrics.items():
+                checkpoint_info[k] = v
+        save_name = 'best_model.pt' if model_name == 'main_model' else 'diffusion_model.pt'
+        torch.save(checkpoint_info, os.path.join(self.checkpoint_dir, save_name))
+        print(f"Saved {model_name} checkpoint. ")
         
-        torch.save(checkpoint_info, os.path.join(self.checkpoint_dir, 'best_model.pt'))
-    
     def load_checkpoint(self):
         ckpt_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
         best_model = torch.load(ckpt_path)
         best_model_state_dict = best_model['model_state_dict']
-        epoch = best_model['epoch']
-        test_f1_score = best_model['test_f1_score']
+        epoch, test_f1_score = -1, -1
+        if "epoch" in best_model:
+            epoch = best_model['epoch']
+        if "test_f1_score" in best_model:
+            test_f1_score = best_model['test_f1_score']
         self.model.load_state_dict(state_dict=best_model_state_dict)
         print(f"Loaded best model checkpoint from {ckpt_path} - Epoch {epoch} - F1-Score {test_f1_score}")
         
@@ -133,19 +139,21 @@ class Trainer:
                 # randomly sample ts
                 n = x_embed_simclr.shape[0]
                 t = torch.randint(low=0, high=self.num_diffusion_steps, size=(n//2+1, )).to(self.device_id)
-                ts = torch.cat([t, self.num_diffusion_steps-t], dim=0)[:n]
+                ts = torch.cat([t, self.num_diffusion_steps-t-1], dim=0)[:n]
                 noise_pred, noise_gt = self.label_denoising_diffusion_model.module.forward_t(x_embed=x_embed_simclr, x0=y, t=ts)
                 loss = self.label_denoising_diffusion_model.module.get_diffusion_loss(noise_pred, noise_gt)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.label_denoising_diffusion_model.parameters(), 1.0)
                 self.diffusion_optimizer.step()
-                
                 train_loss += loss.detach().cpu().numpy()
+                counts += 1
                 if self.device_id == 0 and counts % 200 == 0:
                     print(f"Diffusion loss idx {counts}: ", train_loss/(counts + 1))
-                    
-            print(f"[DIFFUSION] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
-            
+
+            if self.device_id == 0:
+                print(f"[DIFFUSION] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
+                self.save_checkpoint(epoch, None, model_name='diffusion_model')
+                
     def run_pretrain(self):
         
         for epoch in range(self.num_pretrain_epochs):
@@ -166,9 +174,10 @@ class Trainer:
                     print(f"Pre-Training loss idx {counts}: ", train_loss/(counts + 1))
                 
                 counts += 1
-                
-            print(f"[PRE-TRAINING] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
-    
+            
+            if self.device_id == 0: 
+                print(f"[PRE-TRAINING] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
+
         self.close_pretrain()
         
     def train(self):
@@ -187,7 +196,7 @@ class Trainer:
                         x_embed = self.model(x, encode_only=True)
                         y_clean = self.label_denoising_diffusion_model.module.reverse(x_embed, y).long()
                         
-                    print(f"noisy (original) label {y} | clean label {y_clean}")
+                    # print(f"noisy (original) label {y} | clean label {y_clean}")
                     y = y_clean
                     
                 y_hat = self.model(x)
@@ -197,18 +206,19 @@ class Trainer:
 
                 train_loss += loss.detach().cpu().numpy()
                 if self.device_id == 0 and counts % 200 == 0:
-                    print(f"Training loss idx {counts}: ", train_loss/(counts + 1))
+                    print(f"Main training loss idx {counts}: ", train_loss/(counts + 1))
 
                 counts += 1
-                
-            print(f"Training loss for epoch {epoch}: {train_loss / len(train_loader)}")
-            counts = 0
-            val_metrics = self.test()
+            
+            if self.device_id == 0:
+                print(f"[MAIN TRAINING] Training loss for epoch {epoch}: {train_loss / len(train_loader)}")
+                counts = 0
+                val_metrics = self.test()
             
             if (epoch == 0) or (self.device_id == 0 and val_metrics['test_f1_score'] > best_val_metrics['test_f1_score']):
                 print(f"New best validation f1-score {val_metrics['test_f1_score']}, saving model.")
                 best_val_metrics = val_metrics
-                self.save_checkpoint(epoch, best_val_metrics)
+                self.save_checkpoint(epoch, best_val_metrics, model_name='main_model')
             
 def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta, pretrain):
     
@@ -238,7 +248,7 @@ def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta
     
     # optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), weight_decay=1.0e-2)
     optimizer = Adam(model.parameters(), lr=learning_rate)
-    diffusion_optimizer = Adam(diffusion_model.parameters(), lr=learning_rate)
+    diffusion_optimizer = Adam(diffusion_model.parameters(), lr=learning_rate*0.1)
     
     loss = BootstrappedCrossEntropy(weight=None, ignore_index=-100, reduction='mean', bootstrap=bootstrap, beta=beta)
     optimizers = {
@@ -273,9 +283,9 @@ if __name__ == '__main__':
     arg_parser.add_argument('--bootstrap', type=str, default='no_bootstrap')
     arg_parser.add_argument('--beta', type=float, default=0.8, help='weight for noisy labels')
     arg_parser.add_argument('--simclr', action='store_true', help='runs unsupervised pretraining using simclr before main training.')
-    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=0, help='number of epochs for pre-training of the encoder using simclr')
+    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=50, help='number of epochs for pre-training of the encoder using simclr')
     arg_parser.add_argument('--diffusion', action='store_true', help='uses diffusion denoising for clean labels during training.')
-    arg_parser.add_argument('--num_diffusion_epochs', type=int, default=1)
+    arg_parser.add_argument('--num_diffusion_epochs', type=int, default=50)
     
     arg_parser.add_argument('--test', action='store_true')
     args = arg_parser.parse_args()

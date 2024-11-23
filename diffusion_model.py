@@ -101,9 +101,9 @@ class LabelDenoisingDiffusionModel(nn.Module):
     def reverse(self, x_embed, xt):
         # x_embed: [batch, feature_dim]
         # xt: [batch, num_classes]
-        
+        xt = F.one_hot(xt.long(), num_classes=self.x_dim).float().to(self.device_id)
         for t in reversed(range(self.n_steps)):
-            t_tens = torch.tensor(t)
+            t_tens = torch.tensor(t).to(self.device_id)
             noise_pred = self.model(x_embed=x_embed, x=xt, t=t_tens) # [batch, self.x_dim]
             
             sqrt_one_minus_alphas_t = self.sqrt_one_minus_alphas.gather(0, t_tens) # [1]
