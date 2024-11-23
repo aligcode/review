@@ -43,14 +43,15 @@ class ConditionalModel(nn.Module):
         out_cl3 = F.softplus(self.bn3(self.cl3(x=out_cl2, t=t)))
         return self.l4(out_cl3)
         
-class DiffusionModel(nn.Module):
+class LabelDenoisingDiffusionModel(nn.Module):
     
-    def __init__(self, x_dim, x_emb_dim, n_steps):
-        super(DiffusionModel, self).__init__()
+    def __init__(self, device_id, x_dim, x_emb_dim, n_steps):
+        super(LabelDenoisingDiffusionModel, self).__init__()
         self.x_dim = x_dim
         self.n_steps = n_steps
         self.feature_dim = x_emb_dim
-        self.betas = self.get_noise_schedule(schedule='linear', num_steps=self.n_steps, start=1e-5, end=1e-2)
+        self.device_id = device_id
+        self.betas = self.get_noise_schedule(schedule='linear', num_steps=self.n_steps, start=1e-5, end=1e-2).to(self.device_id)
         self.alphas = 1.0 - self.betas
         self.sqrt_alphas = torch.sqrt(self.alphas)
         self.sqrt_one_minus_alphas = torch.sqrt(1.0 - self.alphas)
@@ -71,13 +72,16 @@ class DiffusionModel(nn.Module):
     def q_sample(self, x0, t, noise):
         # x0: [B, 10]
         # t: [B, 1]
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t) # 1
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t)
+        # noise: [B, 10]
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t) # [batch_size]
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t) # [batch_size]
         
         sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t.view(-1, 1)
         sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod_t.view(-1, 1)
-        
-        return sqrt_alphas_cumprod_t * x0 + self.sqrt_one_minus_alphas_cumprod[t] * noise
+        return sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise
+    
+    def get_diffusion_loss(self, pred, gt):
+        return F.mse_loss(pred, gt, reduction='mean')
     
     def forward_t(self, x_embed, x0, t):
         noise = torch.randn_like(x0)
@@ -117,7 +121,7 @@ if __name__ == '__main__':
     feature_dim = 256
     n_steps = 1000
     
-    diffusion_model = DiffusionModel(
+    diffusion_model = LabelDenoisingDiffusionModel(
         x_dim=num_classes,
         x_emb_dim=feature_dim,
         n_steps=n_steps,
@@ -126,15 +130,15 @@ if __name__ == '__main__':
     random_label = torch.randint(low=0, high=10, size=(batch_size, num_classes)).float()
     random_feat = torch.randn(batch_size, feature_dim)
     
-    ts = [1, 100, 600]
+    t = torch.randint(low=0, high=n_steps, size=(batch_size//2+1, ))
+    ts = torch.cat([t, n_steps - t], dim=0)[:batch_size]
     
-    for t in ts:
-        # simulate forward process and learning
-        pred_noise, gt_noise = diffusion_model.forward_t(x_embed=random_feat, x0=random_label, t=torch.tensor(t))
-        print(f"Step {t} gt_noise {gt_noise.shape} | pred_noise {pred_noise.shape}")
-        mse_loss_t = F.mse_loss(pred_noise, gt_noise, reduction='mean')
-        print(f"MSE calculated for step {t}: {mse_loss_t}")
-        
+    # simulate forward process and learning
+    pred_noise, gt_noise = diffusion_model.forward_t(x_embed=random_feat, x0=random_label, t=ts)
+    print(f"gt_noise {gt_noise.shape} | pred_noise {pred_noise.shape}")
+    mse_loss = F.mse_loss(pred_noise, gt_noise, reduction='mean')
+    print(f"MSE calculated: {mse_loss}")
+    
     # backward process (denoising)
     noisy_label_batch = torch.randint(low=0, high=10, size=(batch_size, num_classes)).float()
     random_feat = torch.randn(batch_size, feature_dim)

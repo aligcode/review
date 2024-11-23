@@ -36,7 +36,10 @@ class ConvTwoLayerMLP(nn.Module):
         logits = self.fc2(self.relu(self.fc1(img_feat_flattened)))
         return logits
     
-    def forward(self, x):
+    def forward(self, x, encode_only=False):
+        if encode_only:
+            return self.encode(x)
+        
         if self.pretrain:
             return self.forward_pretrain(x)
         else:

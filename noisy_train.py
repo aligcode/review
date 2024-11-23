@@ -8,14 +8,17 @@ from torchmetrics.classification import F1Score
 import os
 import torch
 from augs import ViewAugmentations
+from diffusion_model import LabelDenoisingDiffusionModel
 import argparse
 import torch.distributed as dist
 import random
 
 class Trainer:
     
-    def __init__(self, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizer, loss, num_epochs, checkpoint_dir):
+    def __init__(self, diffusion, num_diffusion_epochs, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizer, loss, num_epochs, checkpoint_dir):
         
+        self.diffusion = diffusion
+        self.num_diffusion_epochs = num_diffusion_epochs
         self.pretrain = pretrain
         self.num_pretrain_epochs = num_pretrain_epochs
         self.augmentations = ViewAugmentations()
@@ -30,6 +33,19 @@ class Trainer:
         self.optimizer = optimizer
         self.loss = loss
         self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
+        
+        if self.diffusion:
+            assert self.pretrain # in order to use simclr embeddings
+            self.img_emb_dim = 128
+            self.num_classes = 10
+            self.num_diffusion_steps = 1000
+            self.label_denoising_diffusion_model = DDP(LabelDenoisingDiffusionModel(
+                device_id=self.device_id,
+                x_dim=self.num_classes,
+                x_emb_dim=self.img_emb_dim, 
+                n_steps=self.num_diffusion_steps
+            ).to(self.device_id), device_ids=[self.device_id], find_unused_parameters=True)
+
         self.num_epochs = num_epochs
         self.checkpoint_dir = checkpoint_dir
         
@@ -99,7 +115,38 @@ class Trainer:
     def close_pretrain(self):
         self.model.module.pretrain = False
         print("Pretraining turned off.")
+    
+    def run_denoising_model_train(self):
         
+        for epoch in range(self.num_diffusion_epochs):
+            train_loss = 0
+            self.label_denoising_diffusion_model.train()
+            self.model.eval()
+            counts = 0
+            for (x, y) in self.train_loader:
+                self.optimizer.zero_grad()
+                x = self.no_augment(x)
+                x, y = x.to(self.device_id), y.to(self.device_id)
+                with torch.no_grad():
+                    # get the embedding from simclr
+                    x_embed_simclr = self.model(x, encode_only=True) # [batch, 128]
+                    
+                # randomly sample ts
+                n = x_embed_simclr.shape[0]
+                t = torch.randint(low=0, high=self.num_diffusion_steps, size=(n//2+1, )).to(self.device_id)
+                ts = torch.cat([t, self.num_diffusion_steps-t], dim=0)[:n]
+                
+                noise_pred, noise_gt = self.label_denoising_diffusion_model.module.forward_t(x_embed=x_embed_simclr, x0=y.float(), t=ts)
+                loss = self.label_denoising_diffusion_model.module.get_diffusion_loss(noise_pred, noise_gt)
+                loss.backward()
+                self.optimizer.step()
+                
+                train_loss += loss.detach().cpu().numpy()
+                if self.device_id == 0 and counts % 200 == 0:
+                    print(f"Diffusion loss idx {counts}: ", train_loss/(counts + 1))
+                    
+            print(f"[DIFFUSION] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
+            
     def run_pretrain(self):
         
         for epoch in range(self.num_pretrain_epochs):
@@ -135,6 +182,15 @@ class Trainer:
                 self.optimizer.zero_grad() # reset gradients for new batch
                 x = self.no_augment(x)
                 x, y = x.to(self.device_id), y.to(self.device_id)
+                if self.diffusion:
+                    # denoise the labels for training of the original model
+                    with torch.no_grad():
+                        x_embed = self.model(x, encode_only=True)
+                        y_clean = self.label_denoising_diffusion_model.module.reverse(x_embed, y).long()
+                    
+                    print(f"noisy (original) label {y} | clean label {y_clean}")
+                    y = y_clean
+                    
                 y_hat = self.model(x)
                 loss = self.loss(y_hat, y)
                 loss.backward()
@@ -199,7 +255,9 @@ if __name__ == '__main__':
     arg_parser.add_argument('--bootstrap', type=str, default='no_bootstrap')
     arg_parser.add_argument('--beta', type=float, default=0.8, help='weight for noisy labels')
     arg_parser.add_argument('--simclr', action='store_true', help='runs unsupervised pretraining using simclr before main training.')
-    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=20, help='number of epochs for pre-training of the encoder using simclr')
+    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=0, help='number of epochs for pre-training of the encoder using simclr')
+    arg_parser.add_argument('--diffusion', action='store_true', help='uses diffusion denoising for clean labels during training.')
+    arg_parser.add_argument('--num_diffusion_epochs', type=int, default=1)
     
     arg_parser.add_argument('--test', action='store_true')
     args = arg_parser.parse_args()
@@ -231,7 +289,11 @@ if __name__ == '__main__':
         pretrain=pretrain
     )
     
+    diffusion = True if args.diffusion else False
+    num_diffusion_epochs = args.num_diffusion_epochs
     ddp_trainer = Trainer(
+        diffusion=diffusion,
+        num_diffusion_epochs=num_diffusion_epochs,
         pretrain=pretrain,
         num_pretrain_epochs=num_pretrain_epochs,
         model=model, 
@@ -251,6 +313,10 @@ if __name__ == '__main__':
         if pretrain:
             # run pre-training (with simclr)
             ddp_trainer.run_pretrain()
+            
+        if diffusion:
+            # use diffusion denoisiong (relies on embeddings from the simclr training)
+            ddp_trainer.run_denoising_model_train()
             
         ddp_trainer.train()
         
