@@ -7,6 +7,7 @@ from mlp_model import ConvTwoLayerMLP
 from torchmetrics.classification import F1Score
 import os
 import torch
+import copy
 from augs import ViewAugmentations
 from diffusion_model import LabelDenoisingDiffusionModel
 import argparse
@@ -15,7 +16,7 @@ import random
 
 class Trainer:
     
-    def __init__(self, diffusion, num_diffusion_epochs, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizer, loss, num_epochs, checkpoint_dir):
+    def __init__(self, diffusion, diffusion_params, diffusion_model, num_diffusion_epochs, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizers, loss, num_epochs, checkpoint_dir):
         
         self.diffusion = diffusion
         self.num_diffusion_epochs = num_diffusion_epochs
@@ -28,24 +29,22 @@ class Trainer:
             
         self.device_id = int(os.environ['LOCAL_RANK'])
         self.model = model.to(self.device_id)
+        self.diffusion_model = diffusion_model.to(self.device_id)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = optimizer
+        self.optimizer = optimizers['main_optimizer']
         self.loss = loss
         self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
         
         if self.diffusion:
             assert self.pretrain # in order to use simclr embeddings
-            self.img_emb_dim = 128
-            self.num_classes = 10
-            self.num_diffusion_steps = 1000
-            self.label_denoising_diffusion_model = DDP(LabelDenoisingDiffusionModel(
-                device_id=self.device_id,
-                x_dim=self.num_classes,
-                x_emb_dim=self.img_emb_dim, 
-                n_steps=self.num_diffusion_steps
-            ).to(self.device_id), device_ids=[self.device_id], find_unused_parameters=True)
-
+            self.img_emb_dim = diffusion_params['img_emb_dim']
+            self.num_classes = diffusion_params['num_classes'] #10
+            self.num_diffusion_steps = diffusion_params['num_diffusion_steps'] # 1000
+            self.label_denoising_diffusion_model = DDP(self.diffusion_model, device_ids=[self.device_id], find_unused_parameters=True)
+            self.label_denoising_diffusion_model.module.init_params(self.device_id)
+            self.diffusion_optimizer = optimizers['diffusion_optimizer']
+            
         self.num_epochs = num_epochs
         self.checkpoint_dir = checkpoint_dir
         
@@ -124,7 +123,7 @@ class Trainer:
             self.model.eval()
             counts = 0
             for (x, y) in self.train_loader:
-                self.optimizer.zero_grad()
+                self.diffusion_optimizer.zero_grad()
                 x = self.no_augment(x)
                 x, y = x.to(self.device_id), y.to(self.device_id)
                 with torch.no_grad():
@@ -135,11 +134,11 @@ class Trainer:
                 n = x_embed_simclr.shape[0]
                 t = torch.randint(low=0, high=self.num_diffusion_steps, size=(n//2+1, )).to(self.device_id)
                 ts = torch.cat([t, self.num_diffusion_steps-t], dim=0)[:n]
-                
-                noise_pred, noise_gt = self.label_denoising_diffusion_model.module.forward_t(x_embed=x_embed_simclr, x0=y.float(), t=ts)
+                noise_pred, noise_gt = self.label_denoising_diffusion_model.module.forward_t(x_embed=x_embed_simclr, x0=y, t=ts)
                 loss = self.label_denoising_diffusion_model.module.get_diffusion_loss(noise_pred, noise_gt)
                 loss.backward()
-                self.optimizer.step()
+                torch.nn.utils.clip_grad_norm_(self.label_denoising_diffusion_model.parameters(), 1.0)
+                self.diffusion_optimizer.step()
                 
                 train_loss += loss.detach().cpu().numpy()
                 if self.device_id == 0 and counts % 200 == 0:
@@ -187,7 +186,7 @@ class Trainer:
                     with torch.no_grad():
                         x_embed = self.model(x, encode_only=True)
                         y_clean = self.label_denoising_diffusion_model.module.reverse(x_embed, y).long()
-                    
+                        
                     print(f"noisy (original) label {y} | clean label {y_clean}")
                     y = y_clean
                     
@@ -224,11 +223,30 @@ def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True, collate_fn=collate_fn)
     model = ConvTwoLayerMLP(input_dim=3, num_classes=10, pretrain=pretrain)
+
+    diffusion_params = {
+        'img_emb_dim': 128,
+        'num_classes': 10,
+        'num_diffusion_steps': 1000
+    }
+    
+    diffusion_model = LabelDenoisingDiffusionModel(
+                x_dim=diffusion_params['num_classes'],
+                x_emb_dim=diffusion_params['img_emb_dim'], 
+                n_steps=diffusion_params['num_diffusion_steps']
+    )
+    
     # optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), weight_decay=1.0e-2)
     optimizer = Adam(model.parameters(), lr=learning_rate)
-    loss = BootstrappedCrossEntropy(weight=None, ignore_index=-100, reduction='mean', bootstrap=bootstrap, beta=beta)
+    diffusion_optimizer = Adam(diffusion_model.parameters(), lr=learning_rate)
     
-    return train_loader, val_loader, model, optimizer, loss
+    loss = BootstrappedCrossEntropy(weight=None, ignore_index=-100, reduction='mean', bootstrap=bootstrap, beta=beta)
+    optimizers = {
+        'diffusion_optimizer': diffusion_optimizer,
+        'main_optimizer': optimizer
+        
+    }
+    return train_loader, val_loader, model, optimizers, loss, diffusion_model, diffusion_params
 
 def setup_ddp():
     dist.init_process_group(backend='nccl')
@@ -244,7 +262,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False # no auto-optimization 
     torch.use_deterministic_algorithms(True)
     
-# torchrun noise_train.py --nproc_per_node
+# torchrun --nproc_per_node=4 noisy_train.py --batch_size 64 --lr 1e-3 --epochs 300 --noise_type worst  --checkpoint_dir checkpoints_diffusion --simclr --diffusion
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--batch_size', type=int, required=False, default=16, help='training batch size')
@@ -280,7 +298,7 @@ if __name__ == '__main__':
         
     pretrain = True if args.simclr else False
     num_pretrain_epochs = args.num_pretrain_epochs
-    train_loader, val_loader, model, optimizer, loss = load_training_objects(
+    train_loader, val_loader, model, optimizers, loss, diffusion_model, diffusion_params = load_training_objects(
         batch_size=args.batch_size,
         learning_rate=args.lr,
         noise_type=noise_type,
@@ -293,13 +311,15 @@ if __name__ == '__main__':
     num_diffusion_epochs = args.num_diffusion_epochs
     ddp_trainer = Trainer(
         diffusion=diffusion,
+        diffusion_model=diffusion_model,
+        diffusion_params=diffusion_params,
         num_diffusion_epochs=num_diffusion_epochs,
         pretrain=pretrain,
         num_pretrain_epochs=num_pretrain_epochs,
         model=model, 
         train_loader=train_loader,
         val_loader=val_loader,
-        optimizer=optimizer,
+        optimizers=optimizers,
         loss=loss,
         num_epochs=num_epochs,
         checkpoint_dir=checkpoint_dir

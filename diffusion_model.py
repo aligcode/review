@@ -49,11 +49,16 @@ class ConditionalModel(nn.Module):
         
 class LabelDenoisingDiffusionModel(nn.Module):
     
-    def __init__(self, device_id, x_dim, x_emb_dim, n_steps):
+    def __init__(self, x_dim, x_emb_dim, n_steps):
         super(LabelDenoisingDiffusionModel, self).__init__()
         self.x_dim = x_dim
         self.n_steps = n_steps
         self.feature_dim = x_emb_dim
+        self.device_id = None
+
+        self.model = ConditionalModel(x_dim=self.x_dim, n_steps=self.n_steps, feature_dim=self.feature_dim)
+        
+    def init_params(self, device_id):
         self.device_id = device_id
         self.betas = self.get_noise_schedule(schedule='linear', num_steps=self.n_steps, start=1e-5, end=1e-2).to(self.device_id)
         self.alphas = 1.0 - self.betas
@@ -63,8 +68,6 @@ class LabelDenoisingDiffusionModel(nn.Module):
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod) # scaled signal contribution coeff
         self.one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod # noise contribution coeff
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(self.one_minus_alphas_cumprod) # scaled noise contribution coeff
-        
-        self.model = ConditionalModel(x_dim=self.x_dim, n_steps=self.n_steps, feature_dim=self.feature_dim)
         
     def get_noise_schedule(self, schedule='linear', num_steps=1000, start=1e-5, end=1e-2):
     
@@ -77,6 +80,7 @@ class LabelDenoisingDiffusionModel(nn.Module):
         # x0: [B, 10]
         # t: [B, 1]
         # noise: [B, 10]
+        assert self.device_id is not None
         sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t) # [batch_size]
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t) # [batch_size]
         
