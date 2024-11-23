@@ -29,7 +29,7 @@ class Trainer:
         self.val_loader = val_loader
         self.optimizer = optimizer
         self.loss = loss
-        self.model = DDP(self.model, device_ids=[self.device_id])
+        self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
         self.num_epochs = num_epochs
         self.checkpoint_dir = checkpoint_dir
         
@@ -85,7 +85,7 @@ class Trainer:
         augmented_tensors = []
         for pil_img in x:
             augmented_tensors.append(self.augmentations.apply_augmentation(pil_img))
-        return torch.hstack(augmented_tensors)
+        return torch.stack(augmented_tensors, dim=0)
     
     def no_augment(self, x):
         # list of PIL images
@@ -93,19 +93,21 @@ class Trainer:
         for pil_img in x:
             normalized_tensors.append(self.augmentations.normalize_tensorize(pil_img))
         
-        return torch.hstack(normalized_tensors)
+        normalized_tensors = torch.stack(normalized_tensors, dim=0)
+        return normalized_tensors
         
     def close_pretrain(self):
         self.model.module.pretrain = False
         print("Pretraining turned off.")
         
-    def pretrain(self):
+    def run_pretrain(self):
         
         for epoch in range(self.num_pretrain_epochs):
             train_loss = 0
             self.model.train()
             counts = 0 
             for (x, _) in self.train_loader:
+                self.optimizer.zero_grad()
                 x_view1, x_view2 = self.augment(x), self.augment(x)
                 x_view1, x_view2 = x_view1.to(self.device_id), x_view2.to(self.device_id)
                 p1, p2 = self.model(x_view1), self.model(x_view2)
@@ -113,14 +115,14 @@ class Trainer:
                 loss.backward()
                 self.optimizer.step()
                 
-                train_loss += loss.detach().cpu.numpy()
+                train_loss += loss.detach().cpu().numpy()
                 if self.device_id == 0 and counts % 200 == 0:
-                    print(f"Training loss idx {counts}: ", train_loss/(counts + 1))
+                    print(f"Pre-Training loss idx {counts}: ", train_loss/(counts + 1))
                 
                 counts += 1
                 
             print(f"[PRE-TRAINING] Epoch {epoch} training loss:  {train_loss / len(train_loader)}")
-            
+    
         self.close_pretrain()
         
     def train(self):
@@ -197,7 +199,7 @@ if __name__ == '__main__':
     arg_parser.add_argument('--bootstrap', type=str, default='no_bootstrap')
     arg_parser.add_argument('--beta', type=float, default=0.8, help='weight for noisy labels')
     arg_parser.add_argument('--simclr', action='store_true', help='runs unsupervised pretraining using simclr before main training.')
-    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=50, help='number of epochs for pre-training of the encoder using simclr')
+    arg_parser.add_argument('--num_pretrain_epochs', type=int, default=20, help='number of epochs for pre-training of the encoder using simclr')
     
     arg_parser.add_argument('--test', action='store_true')
     args = arg_parser.parse_args()
@@ -241,15 +243,15 @@ if __name__ == '__main__':
         checkpoint_dir=checkpoint_dir
     )
     
+    torch.autograd.set_detect_anomaly(True)
     if args.test:
         ddp_trainer.load_checkpoint()
         ddp_trainer.test()
     else:
         if pretrain:
             # run pre-training (with simclr)
-            ddp_trainer.pretrain()
+            ddp_trainer.run_pretrain()
             
-        
         ddp_trainer.train()
         
     dist.destroy_process_group()

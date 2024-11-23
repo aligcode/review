@@ -1,0 +1,3 @@
+[submodule "cifar-10-100n"]
+	path = cifar-10-100n
+	url = https://github.com/UCSC-REAL/cifar-10-100n.git
