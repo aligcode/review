@@ -1,0 +1,114 @@
+import torch.nn as nn
+import torch
+import torch.nn.functional as F
+
+class ConditionalLayer(nn.Module):
+    def __init__(self, input_dim, feature_dim, n_steps):
+        super(ConditionalLayer, self).__init__()
+        self.output_dim = feature_dim
+        self.linear = nn.Linear(in_features=input_dim, out_features=feature_dim)
+        self.embedding = nn.Embedding(num_embeddings=n_steps, embedding_dim=feature_dim)
+    
+    def forward(self, x, t):
+        # x: [B, input_dim]
+        linear_out = self.linear(x)
+        embed_out = self.embedding(t)
+        
+        return embed_out.view(-1, self.output_dim) * linear_out # [B, output_dim]
+    
+class ConditionalModel(nn.Module):
+    def __init__(self, x_dim, n_steps, feature_dim):
+        super(ConditionalModel, self).__init__()
+        self.x_dim = x_dim
+        self.input_dim = self.x_dim
+        self.output_dim = self.input_dim
+        self.feature_dim = feature_dim
+        self.n_steps = n_steps + 1 # account for 0 indexed embeddings
+        
+        self.x_embed_bn = nn.BatchNorm1d(self.feature_dim)
+        self.cl1 = ConditionalLayer(input_dim=self.x_dim, feature_dim=self.feature_dim, n_steps=self.n_steps)
+        self.bn1 = nn.BatchNorm1d(self.feature_dim)
+        self.cl2 = ConditionalLayer(input_dim=self.feature_dim, feature_dim=self.feature_dim, n_steps=self.n_steps)
+        self.bn2 = nn.BatchNorm1d(self.feature_dim)
+        self.cl3 = ConditionalLayer(input_dim=self.feature_dim, feature_dim=self.feature_dim, n_steps=self.n_steps)
+        self.bn3 = nn.BatchNorm1d(self.feature_dim)
+        self.l4 = nn.Linear(in_features=self.feature_dim, out_features=self.output_dim)
+        
+    def forward(self, x_embed, x, t):
+        
+        x_e = self.x_embed_bn(x_embed)
+        out_cl1 = F.softplus(self.bn1(self.cl1(x=x, t=t)))
+        modulated_x = x_e * out_cl1
+        out_cl2 = F.softplus(self.bn2(self.cl2(x=modulated_x, t=t)))
+        out_cl3 = F.softplus(self.bn3(self.cl3(x=out_cl2, t=t)))
+        return self.l4(out_cl3)
+        
+class DiffusionModel(nn.Module):
+    
+    def __init__(self, x_dim, x_emb_dim, n_steps):
+        super(DiffusionModel, self).__init__()
+        self.x_dim = x_dim
+        self.n_steps = n_steps
+        self.feature_dim = x_emb_dim
+        self.betas = self.get_noise_schedule(schedule='linear', num_steps=self.n_steps, start=1e-5, end=1e-2)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0) # signal contribution
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod) # scaled signal contribution coeff
+        self.one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod # noise contribution coeff
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(self.one_minus_alphas_cumprod) # scaled noise contribution coeff
+        
+        self.model = ConditionalModel(x_dim=self.x_dim, n_steps=self.n_steps, feature_dim=self.feature_dim)
+        
+    def get_noise_schedule(self, schedule='linear', num_steps=1000, start=1e-5, end=1e-2):
+    
+        if schedule == 'linear':
+            betas = torch.linspace(start=start, end=end, steps=num_steps)
+            
+        return betas
+    
+    def q_sample(self, x0, t, noise):
+        # x0: [B, 10]
+        # t: [B, 1]
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod.gather(0, t)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod.gather(0, t)
+        
+        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t.view(-1, 1)
+        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod_t.view(-1, 1)
+        
+        return sqrt_alphas_cumprod_t * x0 + self.sqrt_one_minus_alphas_cumprod[t] * noise
+    
+    def forward_t(self, x_embed, x0, t):
+        noise = torch.randn_like(x0)
+        xt = self.q_sample(x0=x0, t=t, noise=noise)
+        noise_pred = self.model(x_embed=x_embed, x=xt, t=t)
+        return noise_pred, noise
+    
+    def reverse(self):
+        # not implemented yet
+        pass
+    
+        
+        
+
+if __name__ == '__main__':
+    
+    batch_size = 16
+    num_classes = 10
+    feature_dim = 256
+    n_steps = 1000
+    
+    diffusion_model = DiffusionModel(
+        x_dim=num_classes,
+        x_emb_dim=feature_dim,
+        n_steps=n_steps,
+    )
+    
+    random_label = torch.randint(low=0, high=10, size=(batch_size, num_classes)).float()
+    random_feat = torch.randn(batch_size, feature_dim)
+    
+    ts = [1, 100, 600]
+    
+    for t in ts:
+        
+        pred_noise, gt_noise = diffusion_model.forward_t(x_embed=random_feat, x0=random_label, t=torch.tensor(t))
+        print(f"Step {t} gt_noise {gt_noise} | pred_noise {pred_noise}")
