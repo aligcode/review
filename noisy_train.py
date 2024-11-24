@@ -37,7 +37,9 @@ class Trainer:
         self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
         
         if self.diffusion:
-            assert self.pretrain # in order to use simclr embeddings
+            # assert self.pretrain # in order to use simclr embeddings
+            if not self.pretrain:
+                print("Pretraining was off, assuming there is diffusion model checkpoint.")
             self.img_emb_dim = diffusion_params['img_emb_dim']
             self.num_classes = diffusion_params['num_classes'] #10
             self.num_diffusion_steps = diffusion_params['num_diffusion_steps'] # 1000
@@ -61,18 +63,29 @@ class Trainer:
         torch.save(checkpoint_info, os.path.join(self.checkpoint_dir, save_name))
         print(f"Saved {model_name} checkpoint. ")
         
-    def load_checkpoint(self):
-        ckpt_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
-        best_model = torch.load(ckpt_path)
-        best_model_state_dict = best_model['model_state_dict']
-        epoch, test_f1_score = -1, -1
-        if "epoch" in best_model:
-            epoch = best_model['epoch']
-        if "test_f1_score" in best_model:
-            test_f1_score = best_model['test_f1_score']
-        self.model.load_state_dict(state_dict=best_model_state_dict)
-        print(f"Loaded best model checkpoint from {ckpt_path} - Epoch {epoch} - F1-Score {test_f1_score}")
-        
+    def load_checkpoint(self, model_name='main_model'):
+        if model_name == 'main_model':
+            ckpt_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
+            best_model = torch.load(ckpt_path)
+            best_model_state_dict = best_model['model_state_dict']
+            epoch, test_f1_score = -1, -1
+            if "epoch" in best_model:
+                epoch = best_model['epoch']
+            if "test_f1_score" in best_model:
+                test_f1_score = best_model['test_f1_score']
+            self.model.load_state_dict(state_dict=best_model_state_dict)
+            print(f"Loaded best model checkpoint from {ckpt_path} - Epoch {epoch} - F1-Score {test_f1_score}")
+            return True
+        elif model_name == 'diffusion_model':
+            ckpt_path = os.path.join(self.checkpoint_dir, 'diffusion_model.pt')
+            diff_model = torch.load(ckpt_path)
+            self.label_denoising_diffusion_model.load_state_dict(state_dict=diff_model['model_state_dict'])
+            epoch = diff_model['epoch']
+            print(f"Loaded diffusion model checkpoint from {ckpt_path} - Epoch {epoch}")
+            return True
+        else:
+            return False
+    
     def test(self): 
         metrics = {
             'test_loss': 0,
@@ -122,6 +135,10 @@ class Trainer:
         print("Pretraining turned off.")
     
     def run_denoising_model_train(self):
+        
+        if not self.pretrain and self.load_checkpoint(model_name='diffusion_model'):
+            print("Loaded diffusion checkpoint, skipping diffusion training.")
+            return 
         
         for epoch in range(self.num_diffusion_epochs):
             train_loss = 0
@@ -212,8 +229,8 @@ class Trainer:
             
             if self.device_id == 0:
                 print(f"[MAIN TRAINING] Training loss for epoch {epoch}: {train_loss / len(train_loader)}")
-                counts = 0
-                val_metrics = self.test()
+            counts = 0
+            val_metrics = self.test()
             
             if (epoch == 0) or (self.device_id == 0 and val_metrics['test_f1_score'] > best_val_metrics['test_f1_score']):
                 print(f"New best validation f1-score {val_metrics['test_f1_score']}, saving model.")
