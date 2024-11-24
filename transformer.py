@@ -25,10 +25,13 @@ class PositionalEncodings(nn.Module):
     
 class TransformerEncoder(nn.Module):
     
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim,  num_heads):
         super(TransformerEncoder, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        
+        assert self.hidden_dim % num_heads == 0
         
         self.q_w = nn.Linear(in_features=self.input_dim, out_features=self.hidden_dim)
         self.k_w = nn.Linear(in_features=self.input_dim, out_features=self.hidden_dim)
@@ -40,14 +43,19 @@ class TransformerEncoder(nn.Module):
         
         x = self.positional_encodings(x)
         
-        Q = self.q_w(x) # B, L, H
-        K = self.k_w(x) # B, L, H
-        V = self.v_w(x) # B, L, H
-        
-        attention_weights = F.softmax(torch.matmul(Q, K.permute(0, 2, 1))) # B, L, L
-        attended_x = torch.matmul(attention_weights, V) # (B, L, L)*(B, L, H) => (B, L, H)
-        
-        return attended_x
+        Q = self.q_w(x) # B, L, HID
+        K = self.k_w(x) # B, L, HID
+        V = self.v_w(x) # B, L, HID
+        B, L, HID = Q.shape[0], Q.shape[1], Q.shape[2]
+        HEAD = self.num_heads
+        HID = HID // HEAD 
+        Q = Q.view(B, L, HEAD, HID)
+        K = K.view(B, L, HEAD, HID)
+        V = V.view(B, L, HEAD, HID)
+        attention_weights = torch.einsum("blhd,bshd->blhs", Q, K)
+        attended_x = torch.einsum("blhs,blhd->blhd", attention_weights, V)
+        attention_x = attended_x.view(B, L, HEAD * HID)
+        return attention_x
     
     
 
@@ -59,7 +67,7 @@ if __name__ == '__main__':
         hidden_dim = 256
         x = torch.randn(batch_size, sequence_length, input_dim)
         
-        transformer = TransformerEncoder(input_dim=input_dim, hidden_dim=hidden_dim)
+        transformer = TransformerEncoder(input_dim=input_dim, hidden_dim=hidden_dim, num_heads=8)
         
         out = transformer(x)
         print(f"Transformer outputs: {out.shape}")
