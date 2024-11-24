@@ -57,7 +57,6 @@ class TransformerEncoder(nn.Module):
         attention_x = attended_x.view(B, L, HEAD * HID)
         return attention_x
     
-    
 
 if __name__ == '__main__':
         
@@ -71,5 +70,4 @@ if __name__ == '__main__':
         
         out = transformer(x)
         print(f"Transformer outputs: {out.shape}")
-        
         
