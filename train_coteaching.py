@@ -2,7 +2,7 @@ from noisy_dataset import CIFAR10, collate_fn
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from loss import BootstrappedCrossEntropy, NTXentLoss
+from loss import BootstrappedCrossEntropy, NTXentLoss, CoTeachingLoss
 from mlp_model import ConvTwoLayerMLP
 from torchmetrics.classification import F1Score
 import os
@@ -16,7 +16,7 @@ import random
 
 class Trainer:
     
-    def __init__(self, diffusion, diffusion_params, diffusion_model, num_diffusion_epochs, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizers, loss, num_epochs, checkpoint_dir):
+    def __init__(self, model1, model2, diffusion, diffusion_params, diffusion_model, num_diffusion_epochs, pretrain, num_pretrain_epochs, model, train_loader, val_loader, optimizers, loss, num_epochs, checkpoint_dir):
         
         self.diffusion = diffusion
         self.num_diffusion_epochs = num_diffusion_epochs
@@ -24,17 +24,25 @@ class Trainer:
         self.num_pretrain_epochs = num_pretrain_epochs
         self.augmentations = ViewAugmentations()
 
+        
         if self.pretrain:
             self.nt_xent_loss = NTXentLoss()
-            
+        
         self.device_id = int(os.environ['LOCAL_RANK'])
+        self.model1 = model1.to(self.device_id)
+        self.model2 = model2.to(self.device_id)
         self.model = model.to(self.device_id)
         self.diffusion_model = diffusion_model.to(self.device_id)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.optimizer = optimizers['main_optimizer']
         self.loss = loss
-        self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
+        # self.model = DDP(self.model, device_ids=[self.device_id], find_unused_parameters=True)
+        
+        self.model1 = DDP(self.model1, device_ids=[self.device_id], find_unused_parameters=True)
+        self.model2 = DDP(self.model2, device_ids=[self.device_id], find_unused_parameters=True)
+        self.m1_optimizer = optimizers['m1_optimizer']
+        self.m2_optimizer = optimizers['m2_optimizer']
         
         if self.diffusion:
             # assert self.pretrain # in order to use simclr embeddings
@@ -93,16 +101,16 @@ class Trainer:
         }
         f1_metric = F1Score(task='multiclass', num_classes=10).to(self.device_id)
         
-        self.model.eval()
+        self.model1.eval()
         with torch.no_grad():
             for (x, y) in self.val_loader:
                 x = self.no_augment(x)
                 x, y = x.to(self.device_id), y.to(self.device_id)
-                y_hat = self.model(x)
-                loss = self.loss(y_hat, y)
+                y_hat = self.model1(x)
+                loss = 0
                 preds = torch.argmax(torch.softmax(y_hat, dim=-1), dim=-1)
                 f1_score = f1_metric(preds, y)
-                metrics['test_loss'] += loss.detach().cpu().numpy()
+                metrics['test_loss'] += loss
                 metrics['test_f1_score'] += f1_score
         
         if self.device_id == 0:    
@@ -129,6 +137,48 @@ class Trainer:
         
         normalized_tensors = torch.stack(normalized_tensors, dim=0)
         return normalized_tensors
+    
+    def run_coteaching(self):
+        
+        total_m1_loss = 0
+        total_m2_loss = 0
+        for epoch in range(self.num_epochs):
+            count = 0
+            self.model1.train()
+            self.model2.train()
+            for (x, y) in self.train_loader:
+                self.m1_optimizer.zero_grad()
+                self.m2_optimizer.zero_grad()
+                x = self.no_augment(x)
+                x, y = x.to(self.device_id), y.to(self.device_id)
+                fx = self.model1(x)
+                gx = self.model2(x)
+                m1_loss, m2_loss = self.loss(fx=fx, gx=gx, labels=y, epoch=epoch)
+                
+                m1_loss.backward()
+                m2_loss.backward()
+                
+                self.m1_optimizer.step()
+                self.m2_optimizer.step()
+                
+                total_m1_loss += m1_loss.detach().cpu().numpy()
+                total_m2_loss += m2_loss.detach().cpu().numpy()
+                
+                if self.device_id == 0 and count % 100 == 0:
+                    print(f"[COTEACH] Iteration {count} m1 loss {m1_loss.detach().cpu().numpy()} | m2 loss {m2_loss.detach().cpu().numpy()} ")
+                
+                count += 1
+                self.model = self.model1
+                val_metrics = self.test()
+            
+                if (epoch == 0) or (self.device_id == 0 and val_metrics['test_f1_score'] > best_val_metrics['test_f1_score']):
+                    print(f"[COTEACH] New best validation f1-score {val_metrics['test_f1_score']}, saving model.")
+                    best_val_metrics = val_metrics
+                    self.save_checkpoint(epoch, best_val_metrics, model_name='main_model')
+                
+            epoch_m1_loss = total_m1_loss / (len(self.data_loader) * (epoch + 1))
+            epoch_m2_loss = total_m2_loss / (len(self.data_loader) * (epoch + 1))
+            print(f"[COTEACH] Epoch {epoch} m1 loss {epoch_m1_loss} | m2 loss {epoch_m2_loss}")
         
     def close_pretrain(self):
         self.model.module.pretrain = False
@@ -237,7 +287,7 @@ class Trainer:
                 best_val_metrics = val_metrics
                 self.save_checkpoint(epoch, best_val_metrics, model_name='main_model')
             
-def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta, pretrain):
+def load_training_objects(epochs, coteaching, batch_size, learning_rate, noise_type, bootstrap, beta, pretrain):
     
     os.makedirs('cifar_dataset', exist_ok=True)
     noise_path = '/home/faraz/person-detection-sota/review/cifar-10-100n/data/CIFAR-10_human.pt'
@@ -249,8 +299,9 @@ def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True, collate_fn=collate_fn)
-    model = ConvTwoLayerMLP(input_dim=3, num_classes=10, pretrain=pretrain)
-
+    model1 = ConvTwoLayerMLP(input_dim=3, num_classes=10, pretrain=pretrain)
+    model2 = ConvTwoLayerMLP(input_dim=3, num_classes=10, pretrain=pretrain)
+    
     diffusion_params = {
         'img_emb_dim': 128,
         'num_classes': 10,
@@ -264,16 +315,22 @@ def load_training_objects(batch_size, learning_rate, noise_type, bootstrap, beta
     )
     
     # optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), weight_decay=1.0e-2)
-    optimizer = Adam(model.parameters(), lr=learning_rate)
+    optimizer = Adam(model1.parameters(), lr=learning_rate)
     diffusion_optimizer = Adam(diffusion_model.parameters(), lr=learning_rate*0.1)
+
+    # co teaching optimizers
+    m1_optimizer = Adam(model1.parameters(), lr=learning_rate)
+    m2_optimizer = Adam(model2.parameters(), lr=learning_rate)
     
-    loss = BootstrappedCrossEntropy(weight=None, ignore_index=-100, reduction='mean', bootstrap=bootstrap, beta=beta)
+    # loss = BootstrappedCrossEntropy(weight=None, ignore_index=-100, reduction='mean', bootstrap=bootstrap, beta=beta)
+    loss = CoTeachingLoss(total_epochs=epochs)
     optimizers = {
         'diffusion_optimizer': diffusion_optimizer,
-        'main_optimizer': optimizer
-        
+        'main_optimizer': optimizer,
+        'm1_optimizer': m1_optimizer,
+        'm2_optimizer': m2_optimizer
     }
-    return train_loader, val_loader, model, optimizers, loss, diffusion_model, diffusion_params
+    return train_loader, val_loader, model1, optimizers, loss, diffusion_model, diffusion_params, model1, model2
 
 def setup_ddp():
     dist.init_process_group(backend='nccl')
@@ -289,7 +346,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False # no auto-optimization 
     torch.use_deterministic_algorithms(True)
     
-# torchrun --nproc_per_node=4 noisy_train.py --batch_size 64 --lr 1e-3 --epochs 300 --noise_type worst  --checkpoint_dir checkpoints_diffusion --simclr --diffusion
+# torchrun --nproc_per_node=4 noisy_train.py --batch_size 64 --lr 1e-3 --epochs 300 --noise_type worst  --checkpoint_dir checkpoints_coteaching --coteaching
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--batch_size', type=int, required=False, default=16, help='training batch size')
@@ -325,7 +382,9 @@ if __name__ == '__main__':
         
     pretrain = True if args.simclr else False
     num_pretrain_epochs = args.num_pretrain_epochs
-    train_loader, val_loader, model, optimizers, loss, diffusion_model, diffusion_params = load_training_objects(
+    train_loader, val_loader, model, optimizers, loss, diffusion_model, diffusion_params, model1, model2 = load_training_objects(
+        epochs=num_epochs,
+        coteaching=args.coteaching,
         batch_size=args.batch_size,
         learning_rate=args.lr,
         noise_type=noise_type,
@@ -337,6 +396,8 @@ if __name__ == '__main__':
     diffusion = True if args.diffusion else False
     num_diffusion_epochs = args.num_diffusion_epochs
     ddp_trainer = Trainer(
+        model1=model1,
+        model2=model2,
         diffusion=diffusion,
         diffusion_model=diffusion_model,
         diffusion_params=diffusion_params,
@@ -357,6 +418,12 @@ if __name__ == '__main__':
         ddp_trainer.load_checkpoint()
         ddp_trainer.test()
     else:
+        if args.coteaching:
+            
+            ddp_trainer.run_coteaching()
+            dist.destroy_process_group()
+            exit(0)
+            
         if pretrain:
             # run pre-training (with simclr)
             ddp_trainer.run_pretrain()

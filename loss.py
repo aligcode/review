@@ -2,8 +2,39 @@ import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 import torch
+from torch.nn import CrossEntropyLoss
 
-
+class CoTeachingLoss(nn.Module):
+    
+    def __init__(self, total_epochs):
+        super(CoTeachingLoss, self).__init__()
+        self.retention_rate = torch.linspace(start=0.2, end=1., steps=total_epochs).flip(0)
+        print("Co teaching retention rates for each epoch: ", self.retention_rate)
+        
+    def forward(self, fx, gx, labels, epoch):
+        # f_x: classfication logits [B, 10]
+        # g_x same as f_x
+        
+        batch_size = fx.shape[0]
+        current_retention = self.retention_rate[epoch]
+        
+        fx_loss, gx_loss = F.cross_entropy(fx, labels, reduce=False), F.cross_entropy(gx, labels, reduce=False)
+        
+        num_samples = torch.floor(current_retention * batch_size).long()
+        fx_ind = torch.argsort(fx_loss, descending=True, dim=0)
+        gx_ind = torch.argsort(gx_loss, descending=True, dim=0)
+        
+        fx_ind = fx_ind[:num_samples]
+        gx_ind = gx_ind[:num_samples]
+        
+        fx_loss_updated = F.cross_entropy(fx[gx_ind], labels[gx_ind])
+        gx_loss_updated = F.cross_entropy(gx[fx_ind], labels[fx_ind])
+        
+        fx_loss = torch.sum(fx_loss_updated) / num_samples
+        gx_loss = torch.sum(gx_loss_updated) / num_samples
+        
+        return fx_loss, gx_loss
+        
 class NTXentLoss(nn.Module):
 
     def __init__(self):
@@ -102,11 +133,27 @@ class BootstrappedCrossEntropy(nn.Module):
 
 if __name__ == '__main__':
     
-    batch_size = 8
-    hidden_dim = 256
-    p1 = torch.randn(batch_size, hidden_dim)
-    p2 = torch.randn(batch_size, hidden_dim)
+    mode = 'coteachingloss' # 'ntxentloss' 
     
-    simclr_loss = NTXentLoss()
-    loss = simclr_loss(p1, p2).item()
-    print(f"SimCLR loss value is {loss}")
+    
+    if mode == 'ntxentloss':
+        batch_size = 8
+        hidden_dim = 256
+        p1 = torch.randn(batch_size, hidden_dim)
+        p2 = torch.randn(batch_size, hidden_dim)
+        
+        simclr_loss = NTXentLoss()
+        loss = simclr_loss(p1, p2).item()
+        print(f"SimCLR loss value is {loss}")
+    
+    if mode == 'coteachingloss':
+        batch_size = 8
+        num_classes = 10
+        num_epochs = 3
+        fx = torch.randn(batch_size, num_classes)
+        gx = torch.randn(batch_size, num_classes)
+        labels = torch.randint(low=0, high=10, size=(batch_size,))
+        coteachloss = CoTeachingLoss(total_epochs=num_epochs)
+        for epoch in range(num_epochs):
+            f_loss, g_loss = coteachloss(fx=fx, gx=gx, labels=labels, epoch=epoch)
+            print(f"Epoch {epoch} co-teaching f_loss value {f_loss.item()} and g_loss value {g_loss.item()}")
