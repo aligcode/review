@@ -65,8 +65,10 @@ class LabelDenoisingDiffusionModel(nn.Module):
         self.alphas = 1.0 - self.betas
         self.sqrt_alphas = torch.sqrt(self.alphas)
         self.sqrt_one_minus_alphas = torch.sqrt(1.0 - self.alphas)
+        
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0) # signal contribution
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod) # scaled signal contribution coeff
+        
         self.one_minus_alphas_cumprod = 1.0 - self.alphas_cumprod # noise contribution coeff
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(self.one_minus_alphas_cumprod) # scaled noise contribution coeff
         

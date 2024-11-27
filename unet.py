@@ -89,8 +89,8 @@ class VariationalDecoder(nn.Module):
         )
         self.relu = nn.ReLU()
         
-    def forward(self, x_sample, enc1, enc2, enc3, bottleneck):
-
+    def forward(self, enc2, enc3, bottleneck):
+        bottleneck = bottleneck.unsqueeze(-1).unsqueeze(-1)
         upsampled_1 = self.deconv1(bottleneck)
 
         merged_1 = torch.cat([upsampled_1, enc3], dim=1)
@@ -172,7 +172,33 @@ class VariationalEncoder(nn.Module):
         })
         
         return encoded
+    
+    
+class VariationalUNet(nn.Module):
+    
+    def __init__(self):
+        super(VariationalUNet, self).__init__()
         
+        self.encoder = VariationalEncoder(num_input_channels=1, num_hidden_channels=256)
+        self.decoder = VariationalDecoder(num_hidden_channels=256, output_size=512, output_channels=1)
+        
+    def forward(self, x):
+        
+        res = self.encoder(x)
+        mean = res['mean'] # batch, 256
+        logvar = res['logvar'] # batch, 256
+        enc_last = res['enc_last'] # batch, 256
+        enc2 = res['enc2']
+        enc3 = res['enc3']
+    
+        batch_size, hidden_dim = mean.shape[0], mean.shape[1]
+        
+        # reparam
+        sample = mean + torch.exp(logvar) * torch.randn(batch_size, hidden_dim)
+        x_hat = self.decoder(enc2, enc3, sample)
+        
+        return x_hat
+    
 if __name__ == '__main__':
     
     conv_block = ConvBlock(in_channels=1, out_channels=32, stride=3)
@@ -195,7 +221,9 @@ if __name__ == '__main__':
     enc1, enc2, enc3 = res['enc1'], res['enc2'], res['enc3']
     print(f"enc1: {enc1.shape} | enc2: {enc2.shape} | enc3: {enc3.shape}")
     
-    
     sample_x = torch.randn(batch_size, num_hidden_channels)
-    x_hat = variational_decoder(sample_x, enc1, enc2, enc3, encoded)
+    x_hat = variational_decoder(enc2, enc3, sample_x)
     print(f"x.shape {x.shape} | x_hat.shape {x_hat.shape}")
+    
+    variational_unet = VariationalUNet()
+    print("variational UNet x_hat: ", variational_unet(x).shape)
